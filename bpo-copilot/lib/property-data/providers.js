@@ -22,14 +22,27 @@ export function parseAddress(input) {
 const ATTOM_BASE = "https://api.gateway.attomdata.com/propertyapi/v1.0.0";
 
 async function attomGet(path, params, key) {
-  const url = `${ATTOM_BASE}/${path}?` + new URLSearchParams(params).toString();
+  // Drop null/undefined/"" params so we never send e.g. "maxsaleamt=undefined"
+  const clean = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") clean[k] = v;
+  }
+  const url = `${ATTOM_BASE}/${path}?` + new URLSearchParams(clean).toString();
   const res = await fetch(url, { headers: { apikey: key, Accept: "application/json" } });
-  if (!res.ok) throw new Error(`ATTOM ${path} -> ${res.status} ${res.statusText}`);
-  const json = await res.json();
+  const body = await res.text();
+  let json = null;
+  try { json = JSON.parse(body); } catch { /* non-JSON error body */ }
+
+  if (!res.ok) {
+    // Surface ATTOM's real reason (e.g. "SuccessWithoutResult", invalid param) instead of a bare 400
+    const msg = json?.status?.msg || body?.slice(0, 300) || res.statusText;
+    if (/without result/i.test(msg)) return { property: [] }; // no matches, not an error
+    throw new Error(`ATTOM ${path} ${res.status}: ${msg}`);
+  }
+
   const code = json?.status?.code;
   if (code !== 0 && code !== "0") {
-    // code 0 = SuccessWithResult; anything else (e.g. 400/SuccessWithoutResult) -> empty
-    if (json?.status?.msg?.includes("Without")) return { ...json, property: [] };
+    if (/without result/i.test(json?.status?.msg || "")) return { ...json, property: [] };
     throw new Error(`ATTOM ${path} -> ${json?.status?.msg || "error"}`);
   }
   return json;
@@ -51,13 +64,13 @@ export function attomProvider(key = process.env.ATTOM_API_KEY) {
       } catch { /* AVM optional; some plans bundle it into detail */ }
       return { property, avm };
     },
-    async comps({ lat, lng, radius, startDate, endDate, minAmt, maxAmt, pageSize }) {
+    async comps({ lat, lng, radius, pageSize }) {
+      // Keep params minimal and known-valid: geo radius + page size.
+      // Date / price / GLA / type filtering happens in index.js after normalize,
+      // which avoids brittle ATTOM param formats that were causing 400s.
+      if (lat == null || lng == null) return [];
       const json = await attomGet("sale/snapshot", {
-        latitude: lat, longitude: lng, radius,
-        propertytype: "SFR",
-        startsalesearchdate: startDate, endsalesearchdate: endDate,
-        minsaleamt: minAmt, maxsaleamt: maxAmt,
-        pagesize: pageSize, orderby: "saleAmt desc",
+        latitude: lat, longitude: lng, radius, pagesize: pageSize || 50,
       }, key);
       return json.property || [];
     },
