@@ -48,15 +48,15 @@ export function createClient({ provider = "mock", apiKey } = {}) {
     const { subject, missing } = normalizeSubject(rawSub.property, rawSub.avm);
     const origin = { lat: subject.lat, lng: subject.lng };
 
-    // 2) comps (geo radius + date/price window)
+    // 2) comps — fetch by geo radius; all other filtering happens below
     const startDate = isoDaysAgo(Math.round(monthsBack * 30.4));
     const endDate = isoDaysAgo(0);
     const rawComps = await p.comps({
       lat: origin.lat, lng: origin.lng, radius: radiusMi,
-      startDate, endDate, minAmt: minPrice, maxAmt: undefined, pageSize: 50,
+      startDate, minAmt: minPrice, pageSize: 50, // startDate/minAmt used by the mock; ATTOM filters downstream
     });
 
-    // 3) normalize -> distance -> filter -> sort -> cap
+    // 3) normalize -> distance -> filter (recency / price / GLA / self) -> sort -> cap
     const glaLo = subject.gla ? subject.gla * (1 - glaTolerance) : 0;
     const glaHi = subject.gla ? subject.gla * (1 + glaTolerance) : Infinity;
 
@@ -65,6 +65,7 @@ export function createClient({ provider = "mock", apiKey } = {}) {
       .map((c) => ({ ...c, dist: milesBetween(origin, { lat: c.lat, lng: c.lng }) }))
       .filter((c) => c.address && c.address.toUpperCase() !== subject.address.toUpperCase()) // drop the subject itself
       .filter((c) => c.price && c.price >= minPrice)
+      .filter((c) => !c.date || c.date >= startDate) // recency window (dates are YYYY-MM-DD, string-comparable)
       .filter((c) => c.gla == null || (c.gla >= glaLo && c.gla <= glaHi))
       .sort((a, b) => (a.dist ?? 99) - (b.dist ?? 99))
       .slice(0, maxComps);
