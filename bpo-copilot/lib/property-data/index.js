@@ -63,10 +63,11 @@ export function createClient({ provider = "mock", apiKey } = {}) {
     const comps = rawComps
       .map((raw, i) => normalizeComp(raw, i))
       .map((c) => ({ ...c, dist: milesBetween(origin, { lat: c.lat, lng: c.lng }) }))
-      .filter((c) => c.address && c.address.toUpperCase() !== subject.address.toUpperCase()) // drop the subject itself
+      // drop the subject itself (same ATTOM id, or same address as fallback)
+      .filter((c) => (c.attomId && subject.attomId ? c.attomId !== subject.attomId : (c.address || "").toUpperCase() !== (subject.address || "").toUpperCase()))
       .filter((c) => c.price && c.price >= minPrice)
-      .filter((c) => !c.date || c.date >= startDate) // recency window (dates are YYYY-MM-DD, string-comparable)
-      .filter((c) => c.gla == null || (c.gla >= glaLo && c.gla <= glaHi))
+      .filter((c) => !c.date || c.date >= startDate) // recency window (YYYY-MM-DD, string-comparable)
+      .filter((c) => c.gla == null || !subject.gla || (c.gla >= glaLo && c.gla <= glaHi))
       .sort((a, b) => (a.dist ?? 99) - (b.dist ?? 99))
       .slice(0, maxComps);
 
