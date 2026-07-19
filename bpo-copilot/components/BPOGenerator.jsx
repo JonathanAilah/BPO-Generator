@@ -3,38 +3,47 @@ import React, { useState, useMemo } from "react";
 
 /*
   BPO Generator (Next.js client component).
-  Data + narrative come from server API routes so no keys touch the browser:
-    - POST /api/bpo        -> { subject, comps, meta }  (ATTOM or mock)
-    - POST /api/narrative  -> { subject, marketing, comps }  (falls back to template)
-  The scoring / adjustment / reconciliation engine runs client-side for
-  interactivity (re-scores as the agent toggles comps).
+  Data + narrative come from server API routes (keys stay server-side):
+    - POST /api/bpo        -> { subject, comps, meta }
+    - POST /api/narrative  -> { subject, marketing, comps }
+  Agent controls: adjustable search (radius / months / GLA), fully editable
+  comp fields, and manual "add a comp". Scoring/adjustment/reconciliation run
+  client-side and recompute live as the agent edits.
 */
 
-// ---------------- engine + constants ----------------
 const MARKET = { supply: "Over supply", trend: "Declining", pricePct: -3, ownerOcc: 55, tenantOcc: 45, avgDom: 133, activeListings: 7, sold12mo: 10, saleLow: 149000, saleHigh: 435000 };
 const RULES = { gla: 40, lot: 1, year: 100, room: 5000, full: 5000, half: 2500, garage: 2500, fireplace: 2500, condition: 20000, heating: 8000, cooling: 6000 };
 const MARKUP = 0.02;
 const CONDITIONS = ["Poor", "Fair", "Average", "Above Average", "Good", "Excellent"];
+const HEATING = ["Forced Hot Water", "Central", "Electric", "Other"];
+const COOLING = ["Central", "Wall", "None"];
+const SELECT_OPTS = { condition: CONDITIONS, heating: HEATING, cooling: COOLING };
 const condRank = (c) => Math.max(0, CONDITIONS.indexOf(c));
 const meetsHeat = (h) => (h === "Other" ? 0 : 1);
 const meetsCool = (c) => (c === "Central" ? 1 : 0);
 const monthsSince = (d) => (Date.now() - new Date(d)) / (1000 * 60 * 60 * 24 * 30.4);
 const usd = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(Math.round(n || 0));
 const round500 = (n) => Math.round(n / 500) * 500;
+const fmt = (v) => (v == null ? "—" : String(v));
 
 function score(subject, c, med) {
   const cl = (x) => Math.max(0, Math.min(1, x));
-  const dist = cl(1 - c.dist / 1.0), gla = cl(1 - Math.abs(c.gla - subject.gla) / 800), lot = cl(1 - Math.abs(c.lot - subject.lot) / 7500);
-  const year = cl(1 - Math.abs(c.year - subject.year) / 60), recency = cl(1 - monthsSince(c.date) / 18), bed = cl(1 - Math.abs(c.beds - subject.beds) / 3);
-  const ppsf = cl(1 - Math.abs(c.price / c.gla - med) / med / 0.5);
+  const dist = c.dist == null ? 0.5 : cl(1 - c.dist / 1.0);
+  const gla = c.gla == null || subject.gla == null ? 0.5 : cl(1 - Math.abs(c.gla - subject.gla) / 800);
+  const lot = c.lot == null || subject.lot == null ? 0.5 : cl(1 - Math.abs(c.lot - subject.lot) / 7500);
+  const year = c.year == null || subject.year == null ? 0.5 : cl(1 - Math.abs(c.year - subject.year) / 60);
+  const recency = c.date ? cl(1 - monthsSince(c.date) / 18) : 0.5;
+  const bed = c.beds == null || subject.beds == null ? 0.5 : cl(1 - Math.abs(c.beds - subject.beds) / 3);
+  const ppsf = c.gla && c.price && med ? cl(1 - Math.abs(c.price / c.gla - med) / med / 0.5) : 0.5;
   return { composite: dist * 0.24 + gla * 0.22 + recency * 0.17 + year * 0.1 + lot * 0.06 + bed * 0.06 + ppsf * 0.15 };
 }
 function lines(subject, c, r) {
+  const D = (a, b) => (a == null || b == null ? 0 : a - b); // unknown -> no adjustment
   return [
-    { key: "gla", label: "Living area (GLA)", adj: (subject.gla - c.gla) * r.gla }, { key: "lot", label: "Lot size", adj: (subject.lot - c.lot) * r.lot },
-    { key: "year", label: "Year built", adj: (subject.year - c.year) * r.year }, { key: "rooms", label: "Rooms", adj: (subject.rooms - c.rooms) * r.room },
-    { key: "full", label: "Full baths", adj: (subject.full - c.full) * r.full }, { key: "half", label: "Half baths", adj: (subject.half - c.half) * r.half },
-    { key: "garage", label: "Garage bays", adj: (subject.garage - c.garage) * r.garage }, { key: "fireplaces", label: "Fireplaces", adj: (subject.fireplaces - c.fireplaces) * r.fireplace },
+    { key: "gla", label: "Living area (GLA)", adj: D(subject.gla, c.gla) * r.gla }, { key: "lot", label: "Lot size", adj: D(subject.lot, c.lot) * r.lot },
+    { key: "year", label: "Year built", adj: D(subject.year, c.year) * r.year }, { key: "rooms", label: "Rooms", adj: D(subject.rooms, c.rooms) * r.room },
+    { key: "full", label: "Full baths", adj: D(subject.full, c.full) * r.full }, { key: "half", label: "Half baths", adj: D(subject.half, c.half) * r.half },
+    { key: "garage", label: "Garage bays", adj: D(subject.garage, c.garage) * r.garage }, { key: "fireplaces", label: "Fireplaces", adj: D(subject.fireplaces, c.fireplaces) * r.fireplace },
     { key: "condition", label: "Condition", adj: (condRank(subject.condition) - condRank(c.condition)) * r.condition }, { key: "heating", label: "Heating", adj: (meetsHeat(subject.heating) - meetsHeat(c.heating)) * r.heating },
     { key: "cooling", label: "Cooling", adj: (meetsCool(subject.cooling) - meetsCool(c.cooling)) * r.cooling },
   ];
@@ -48,16 +57,16 @@ function templateNarrative(subject, sold, reconciled) {
   return {
     subject: `The subject is a ${subject.year}-built, ${subject.stories}-story detached single-family residence of approximately ${subject.gla} sq ft on a ${subject.lot} sq ft lot. It presents in ${subject.condition.toLowerCase()} condition with normal wear consistent with its age and no visible health or safety issues.`,
     marketing: `The subject sits in a ${MARKET.trend.toLowerCase()} market with ${MARKET.supply.toLowerCase()} and average marketing time near ${MARKET.avgDom} days. Financing is most likely Cash or Conventional. A recommended list price of ${usd(reconciled)} is supported by the adjusted comparable range.`,
-    comps: sold.map((c) => `Located ${c.dist} mi from the subject. ${c.adjusted >= reconciled ? "Superior" : "Inferior"} on net after adjustment for living area, age and site differences. Adjusted to ${usd(c.adjusted)} (${(c.grossPct * 100).toFixed(0)}% gross).`),
+    comps: sold.map((c) => `Located ${c.dist ?? "?"} mi from the subject. ${c.adjusted >= reconciled ? "Superior" : "Inferior"} on net after adjustment for living area, age and site differences. Adjusted to ${usd(c.adjusted)} (${(c.grossPct * 100).toFixed(0)}% gross).`),
   };
 }
 
-// ---------------- UI ----------------
 const T = { ink: "#111c26", sub: "#5c6b76", faint: "#8b98a1", paper: "#eceff1", card: "#ffffff", line: "#dde3e7", hair: "#eef1f3", accent: "#0e5a4a", accentSoft: "#e7f0ed", accentLine: "#bcd4cd", pos: "#0f7a52", neg: "#b1503f", hi: "#f4f1e6", warn: "#b5761f", warnSoft: "#f7efdd", warnLine: "#e6cfa0" };
 const label = { fontSize: 10.5, letterSpacing: "0.09em", textTransform: "uppercase", color: T.faint, fontWeight: 600 };
 const mono = { fontVariantNumeric: "tabular-nums", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" };
 const card = { background: T.card, border: `1px solid ${T.line}`, borderRadius: 14 };
 const btn = (p, d) => ({ border: `1px solid ${p ? T.accent : T.line}`, background: p ? T.accent : T.card, color: p ? "#fff" : T.ink, borderRadius: 9, padding: "10px 18px", fontSize: 13.5, fontWeight: 600, cursor: d ? "not-allowed" : "pointer", opacity: d ? 0.55 : 1 });
+const cellInput = { width: "100%", border: "none", background: "transparent", ...mono, fontSize: 11.5, color: T.ink, outline: "none", padding: "3px 2px" };
 const STEPS = ["Address", "Subject", "Comps", "Adjustments", "Opinion", "BPO"];
 
 export default function BPOGenerator() {
@@ -67,18 +76,19 @@ export default function BPOGenerator() {
   const [error, setError] = useState(null);
   const [data, setData] = useState(null);
   const [subject, setSubject] = useState(null);
+  const [comps, setComps] = useState([]);
   const [selected, setSelected] = useState([]);
   const [confirmed, setConfirmed] = useState({});
+  const [searchOpts, setSearchOpts] = useState({ radiusMi: 2, monthsBack: 18, glaPct: 60 });
   const [narrative, setNarrative] = useState(null);
   const [narrativeState, setNarrativeState] = useState("idle");
 
-  const pool = data?.comps || [];
   const flagged = useMemo(() => new Set(data?.meta?.missingFields || []), [data]);
-  const med = useMemo(() => { const s = pool.map((c) => c.price / c.gla).sort((a, b) => a - b); return s[Math.floor(s.length / 2)] || 200; }, [pool]);
-  const scored = useMemo(() => (subject ? pool.map((c) => ({ ...c, ...score(subject, c, med) })).sort((a, b) => b.composite - a.composite) : []), [subject, pool, med]);
+  const med = useMemo(() => { const s = comps.filter((c) => c.gla && c.price).map((c) => c.price / c.gla).sort((a, b) => a - b); return s[Math.floor(s.length / 2)] || 200; }, [comps]);
+  const scored = useMemo(() => (subject ? comps.map((c) => ({ ...c, ...score(subject, c, med) })).sort((a, b) => b.composite - a.composite) : []), [subject, comps, med]);
   const autoPick = useMemo(() => scored.filter((c) => c.status === "sold").slice(0, 3).map((c) => c.id), [scored]);
   const activeSel = selected.length ? selected : autoPick;
-  const evaluated = useMemo(() => (subject ? activeSel.map((id) => evalComp(subject, pool.find((c) => c.id === id), RULES)).filter(Boolean) : []), [activeSel, subject, pool]);
+  const evaluated = useMemo(() => (subject ? activeSel.map((id) => evalComp(subject, comps.find((c) => c.id === id), RULES)).filter(Boolean) : []), [activeSel, subject, comps]);
 
   const recon = useMemo(() => {
     if (!evaluated.length) return { min: 0, max: 0, weighted: 0, bestId: null };
@@ -89,19 +99,38 @@ export default function BPOGenerator() {
   }, [evaluated]);
   const opinion = useMemo(() => { const s90 = round500(recon.weighted), s30 = round500(s90 * 0.985); return { sale90: s90, list90: round500(s90 * (1 + MARKUP)), sale30: s30, list30: round500(s30 * (1 + MARKUP)), land: round500(recon.weighted * 0.31), repairs: 0 }; }, [recon]);
 
-  const runPull = async () => {
+  const fetchData = async (opts, initial) => {
     setPulling(true); setError(null);
     try {
-      const res = await fetch("/api/bpo", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ address }) });
+      const body = { address, options: { radiusMi: +opts.radiusMi, monthsBack: +opts.monthsBack, glaTolerance: (+opts.glaPct) / 100, maxComps: 12 } };
+      const res = await fetch("/api/bpo", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
       const json = await res.json();
       if (!res.ok || json.error) throw new Error(json.error || "lookup failed");
-      if (!json.subject) throw new Error("No record found for that address.");
-      setData(json); setSubject(json.subject); setSelected([]); setConfirmed({}); setNarrative(null); setNarrativeState("idle"); setStep(1);
+      if (!json.subject) throw new Error("No public record found for that address.");
+      setData(json);
+      setComps(json.comps || []);
+      setSelected([]); setNarrative(null); setNarrativeState("idle");
+      if (initial) { setSubject(json.subject); setConfirmed({}); setStep(1); }
     } catch (e) { setError(String(e.message || e)); }
     finally { setPulling(false); }
   };
-  const setSubj = (k, v, n = true) => { setSubject((s) => ({ ...s, [k]: n ? (v === "" || isNaN(+v) ? 0 : +v) : v })); if (flagged.has(k)) setConfirmed((c) => ({ ...c, [k]: true })); };
+  const runPull = () => fetchData(searchOpts, true);
+  const rerun = () => fetchData(searchOpts, false);
+
+  const setSubj = (k, v, n = true) => { setSubject((s) => ({ ...s, [k]: n ? (v === "" ? null : isNaN(+v) ? s[k] : +v) : v })); if (flagged.has(k)) setConfirmed((c) => ({ ...c, [k]: true })); };
+  const updateComp = (id, k, v, n = true) => setComps((cs) => cs.map((c) => (c.id === id ? { ...c, [k]: n ? (v === "" ? null : isNaN(+v) ? c[k] : +v) : v } : c)));
   const toggle = (id) => { const base = selected.length ? [...selected] : [...autoPick]; const i = base.indexOf(id); if (i >= 0) base.splice(i, 1); else base.push(id); setSelected(base); };
+  const addComp = () => {
+    const id = `manual_${Date.now()}`;
+    const s = subject || {};
+    setComps((cs) => [{
+      id, attomId: null, address: "New comparable", status: "sold", price: s.avm || 0, date: new Date().toISOString().slice(0, 10), dist: 0,
+      gla: s.gla ?? null, lot: s.lot ?? null, year: s.year ?? null, stories: s.stories ?? 1, beds: s.beds ?? null, rooms: s.rooms ?? null,
+      full: s.full ?? null, half: s.half ?? 0, garage: s.garage ?? null, fireplaces: s.fireplaces ?? null,
+      condition: "Average", heating: s.heating || "Forced Hot Water", cooling: s.cooling || "Central", source: "Manual",
+    }, ...cs]);
+    setSelected((sel) => [...(sel.length ? sel : autoPick), id]);
+  };
   const genNarrative = async () => {
     setNarrativeState("loading");
     try {
@@ -116,7 +145,7 @@ export default function BPOGenerator() {
 
   return (
     <div style={{ background: T.paper, minHeight: "100%", padding: "20px 14px 44px", color: T.ink, fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif" }}>
-      <div style={{ maxWidth: 960, margin: "0 auto" }}>
+      <div style={{ maxWidth: 980, margin: "0 auto" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
           <div style={{ width: 30, height: 30, borderRadius: 8, background: T.accent, color: "#fff", display: "grid", placeItems: "center", fontWeight: 800, fontSize: 15 }}>B</div>
           <div style={{ fontWeight: 700, fontSize: 16 }}>BPO Copilot</div>
@@ -144,13 +173,13 @@ export default function BPOGenerator() {
             {pulling && <div style={{ marginTop: 18, ...label, color: T.sub }}>● Fetching public records + scoring comps…</div>}
             {error && <div style={{ marginTop: 16, padding: "11px 13px", background: "#fbeeeb", border: `1px solid #e6bcb2`, borderRadius: 9, fontSize: 12.5, color: T.neg }}>{error}</div>}
             <div style={{ marginTop: 26, padding: 14, background: T.hi, borderRadius: 10, fontSize: 12.5, color: T.sub, lineHeight: 1.55, maxWidth: 640 }}>
-              <b style={{ color: T.ink }}>Data source.</b> Runs on built-in mock data until you set <code>ATTOM_API_KEY</code>; then the same pipeline pulls live public records. The key stays on the server.
+              <b style={{ color: T.ink }}>Data source.</b> Runs on built-in mock data until <code>ATTOM_API_KEY</code> is set; then the same pipeline pulls live public records. You can widen the comp search and edit every field on the next steps.
             </div>
           </div>
         )}
 
         {step === 1 && subject && (
-          <Section title="Subject property" sub="Auto-filled from public records. Confirm the flagged fields — public records can't see inside." pill={data.meta.provider}>
+          <Section title="Subject property" sub="Auto-filled from public records. Every field is editable — confirm the flagged ones from your inspection." pill={data.meta.provider}>
             {needConfirm.length > 0 && (
               <div style={{ background: T.warnSoft, border: `1px solid ${T.warnLine}`, borderRadius: 10, padding: "11px 14px", marginBottom: 14, fontSize: 12.5, color: "#7a5210", lineHeight: 1.5 }}>
                 <b>{needConfirm.length} field{needConfirm.length > 1 ? "s" : ""} to confirm from your inspection:</b> {needConfirm.join(", ")}. These aren't in public records — set them from what you saw on site.
@@ -160,67 +189,95 @@ export default function BPOGenerator() {
               {[["gla", "Living area (sf)"], ["lot", "Lot (sf)"], ["year", "Year built"], ["beds", "Bedrooms"], ["rooms", "Rooms"], ["full", "Full baths"], ["half", "Half baths"], ["garage", "Garage bays"], ["fireplaces", "Fireplaces"], ["stories", "Stories"]].map(([k, lbl]) => (
                 <Field key={k} lbl={lbl} value={subject[k]} onChange={(v) => setSubj(k, v)} flag={flagged.has(k)} confirmed={!!confirmed[k]} />
               ))}
-              {[["condition", CONDITIONS], ["heating", ["Forced Hot Water", "Central", "Electric", "Other"]], ["cooling", ["Central", "Wall", "None"]]].map(([k, opts]) => (
+              {[["condition", CONDITIONS], ["heating", HEATING], ["cooling", COOLING]].map(([k, opts]) => (
                 <FieldSelect key={k} lbl={k[0].toUpperCase() + k.slice(1)} value={subject[k]} opts={opts} onChange={(v) => setSubj(k, v, false)} flag={flagged.has(k)} confirmed={!!confirmed[k]} />
               ))}
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px,1fr))", gap: 12, marginTop: 14 }}>
-              <MiniStat lbl="APN" val={subject.apn} small /><MiniStat lbl="Assessed" val={usd(subject.assessed)} />
+              <MiniStat lbl="APN" val={fmt(subject.apn)} small /><MiniStat lbl="Assessed" val={usd(subject.assessed)} />
               <MiniStat lbl="AVM" val={usd(subject.avm)} note={subject.avmLow ? `${usd(subject.avmLow)}–${usd(subject.avmHigh)}` : null} accent />
-              <MiniStat lbl="Last sale" val={usd(subject.lastSale)} note={subject.lastSaleDate} small />
+              <MiniStat lbl="Last sale" val={subject.lastSale ? usd(subject.lastSale) : "—"} note={subject.lastSaleDate} small />
             </div>
             <NavRow onBack={() => go(0)} onNext={() => go(2)} nextLabel="Review comps →" />
           </Section>
         )}
 
         {step === 2 && subject && (
-          <Section title="Comparable selection" sub={`${scored.length} sold comps, scored by proximity, recency & similarity. Top 3 auto-selected.`} pill="Sold · public records">
+          <Section title="Comparable selection" sub={`${scored.length} comp${scored.length === 1 ? "" : "s"} scored by proximity, recency & similarity. Adjust the search or add your own.`} pill="Sold · public records">
+            {/* search controls */}
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", padding: 12, background: T.paper, borderRadius: 11, marginBottom: 14 }}>
+              <Ctl lbl="Radius (mi)" value={searchOpts.radiusMi} onChange={(v) => setSearchOpts((o) => ({ ...o, radiusMi: v }))} />
+              <Ctl lbl="Last (months)" value={searchOpts.monthsBack} onChange={(v) => setSearchOpts((o) => ({ ...o, monthsBack: v }))} />
+              <Ctl lbl="GLA ± (%)" value={searchOpts.glaPct} onChange={(v) => setSearchOpts((o) => ({ ...o, glaPct: v }))} />
+              <button onClick={rerun} disabled={pulling} style={btn(false, pulling)}>{pulling ? "Searching…" : "↻ Re-run search"}</button>
+              <button onClick={addComp} style={btn(true)}>+ Add comp</button>
+            </div>
+            {error && <div style={{ marginBottom: 12, padding: "10px 12px", background: "#fbeeeb", border: `1px solid #e6bcb2`, borderRadius: 9, fontSize: 12.5, color: T.neg }}>{error}</div>}
+            {scored.length < 3 && (
+              <div style={{ marginBottom: 12, padding: "10px 12px", background: T.warnSoft, border: `1px solid ${T.warnLine}`, borderRadius: 9, fontSize: 12.5, color: "#7a5210", lineHeight: 1.5 }}>
+                Only {scored.length} comp{scored.length === 1 ? "" : "s"} found — thin for a low-turnover area. Widen the radius or months above, or <b>+ Add comp</b> to enter one you know.
+              </div>
+            )}
             <div style={{ display: "grid", gap: 8 }}>
               {scored.map((c) => { const on = activeSel.includes(c.id); return (
                 <button key={c.id} onClick={() => toggle(c.id)} style={{ textAlign: "left", cursor: "pointer", display: "grid", gridTemplateColumns: "18px 1fr auto", gap: 12, alignItems: "center", background: on ? T.accentSoft : T.card, border: `1px solid ${on ? T.accentLine : T.line}`, borderRadius: 11, padding: "11px 14px" }}>
                   <div style={{ width: 18, height: 18, borderRadius: 5, border: `1.5px solid ${on ? T.accent : T.line}`, background: on ? T.accent : "transparent", display: "grid", placeItems: "center", color: "#fff", fontSize: 12 }}>{on ? "✓" : ""}</div>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{ fontWeight: 600, fontSize: 13.5 }}>{c.address}</div>
-                    <div style={{ ...mono, fontSize: 11.5, color: T.sub, marginTop: 3 }}>{usd(c.price)} · {c.dist} mi · {c.gla} sf · {c.beds}bd · {c.year} · {c.date}</div>
+                    <div style={{ fontWeight: 600, fontSize: 13.5 }}>{c.address}{c.source === "Manual" && <span style={{ ...label, color: T.accent, marginLeft: 6 }}>manual</span>}</div>
+                    <div style={{ ...mono, fontSize: 11.5, color: T.sub, marginTop: 3 }}>{usd(c.price)} · {fmt(c.dist)} mi · {fmt(c.gla)} sf · {fmt(c.beds)}bd · {fmt(c.year)} · {fmt(c.date)}</div>
                   </div>
                   <div style={{ textAlign: "right" }}><div style={{ ...mono, fontWeight: 700, fontSize: 14, color: c.composite > 0.7 ? T.accent : T.ink }}>{(c.composite * 100).toFixed(0)}</div><div style={{ ...label, color: T.faint }}>match</div></div>
                 </button>
               ); })}
             </div>
-            <NavRow onBack={() => go(1)} onNext={() => go(3)} nextLabel={`Adjust ${activeSel.length} comps →`} />
+            <NavRow onBack={() => go(1)} onNext={() => go(3)} nextLabel={`Adjust ${activeSel.length} comp${activeSel.length === 1 ? "" : "s"} →`} />
           </Section>
         )}
 
         {step === 3 && subject && evaluated.length > 0 && (
-          <Section title="Adjustment grid" sub="Every line computes from the rules engine." pill="Rules engine">
+          <Section title="Adjustment grid" sub="Every comp cell is editable — fill blanks or correct data and adjustments recompute live." pill="Rules engine">
             <div style={{ ...card, overflow: "hidden" }}><div style={{ overflowX: "auto" }}>
-              <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 560 }}>
+              <table style={{ borderCollapse: "collapse", width: "100%", minWidth: 600 }}>
                 <thead><tr>
                   <th style={{ textAlign: "left", padding: "12px 14px", ...label, background: T.card, position: "sticky", left: 0, minWidth: 130 }}>Feature</th>
                   <th style={{ padding: "10px", ...label, color: T.ink, background: T.hi, borderLeft: `1px solid ${T.line}` }}>Subject</th>
-                  {evaluated.map((e) => (<th key={e.id} style={{ padding: "10px", borderLeft: `1px solid ${T.line}`, minWidth: 132, background: e.id === recon.bestId ? T.accentSoft : T.card }}><div style={{ fontSize: 11.5, fontWeight: 700 }}>{e.address.split(" ").slice(0, 2).join(" ")}</div><div style={{ ...mono, fontSize: 10.5, color: T.sub }}>{usd(e.price)}</div></th>))}
+                  {evaluated.map((e) => (
+                    <th key={e.id} style={{ padding: "8px 10px", borderLeft: `1px solid ${T.line}`, minWidth: 150, background: e.id === recon.bestId ? T.accentSoft : T.card, verticalAlign: "top" }}>
+                      <input value={e.address} onChange={(ev) => updateComp(e.id, "address", ev.target.value, false)} style={{ ...cellInput, fontSize: 11.5, fontWeight: 700 }} />
+                      <div style={{ display: "flex", alignItems: "center", gap: 2, marginTop: 2 }}>
+                        <span style={{ color: T.faint, fontSize: 11 }}>$</span>
+                        <input value={e.price ?? ""} onChange={(ev) => updateComp(e.id, "price", ev.target.value)} inputMode="numeric" style={{ ...cellInput, fontWeight: 600 }} />
+                      </div>
+                    </th>
+                  ))}
                 </tr></thead>
                 <tbody>
-                  {lines(subject, evaluated[0], RULES).map((meta, ri) => (
-                    <tr key={meta.key} style={{ borderTop: `1px solid ${T.hair}` }}>
-                      <td style={{ padding: "6px 14px", fontSize: 12, position: "sticky", left: 0, background: T.card }}>{meta.label}</td>
-                      <td style={{ ...mono, fontSize: 12, textAlign: "center", background: T.hi, borderLeft: `1px solid ${T.line}` }}>{String(subject[meta.key])}</td>
-                      {evaluated.map((e) => { const l = e.L[ri]; return (
-                        <td key={e.id} style={{ borderLeft: `1px solid ${T.line}`, padding: "5px 10px", background: e.id === recon.bestId ? T.accentSoft : T.card }}>
-                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
-                            <span style={{ ...mono, fontSize: 11.5, color: T.sub }}>{String(e[meta.key])}</span>
-                            <span style={{ ...mono, fontSize: 11, fontWeight: 600, color: l.adj > 0 ? T.pos : l.adj < 0 ? T.neg : T.faint }}>{l.adj ? `${l.adj > 0 ? "+" : "−"}${usd(Math.abs(l.adj))}` : "—"}</span>
-                          </div>
-                        </td>
-                      ); })}
-                    </tr>
-                  ))}
+                  {lines(subject, evaluated[0], RULES).map((meta, ri) => {
+                    const isSel = !!SELECT_OPTS[meta.key];
+                    return (
+                      <tr key={meta.key} style={{ borderTop: `1px solid ${T.hair}` }}>
+                        <td style={{ padding: "6px 14px", fontSize: 12, position: "sticky", left: 0, background: T.card }}>{meta.label}</td>
+                        <td style={{ ...mono, fontSize: 12, textAlign: "center", background: T.hi, borderLeft: `1px solid ${T.line}` }}>{fmt(subject[meta.key])}</td>
+                        {evaluated.map((e) => { const l = e.L[ri]; return (
+                          <td key={e.id} style={{ borderLeft: `1px solid ${T.line}`, padding: "3px 8px", background: e.id === recon.bestId ? T.accentSoft : T.card }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                              {isSel
+                                ? <select value={e[meta.key]} onChange={(ev) => updateComp(e.id, meta.key, ev.target.value, false)} style={{ ...cellInput, cursor: "pointer" }}>{SELECT_OPTS[meta.key].map((o) => <option key={o}>{o}</option>)}</select>
+                                : <input value={e[meta.key] ?? ""} placeholder="—" onChange={(ev) => updateComp(e.id, meta.key, ev.target.value)} inputMode="numeric" style={cellInput} />}
+                              <span style={{ ...mono, fontSize: 11, fontWeight: 600, whiteSpace: "nowrap", color: l.adj > 0 ? T.pos : l.adj < 0 ? T.neg : T.faint }}>{l.adj ? `${l.adj > 0 ? "+" : "−"}${usd(Math.abs(l.adj))}` : "—"}</span>
+                            </div>
+                          </td>
+                        ); })}
+                      </tr>
+                    );
+                  })}
                   <TotalRow label="Net adj." cells={evaluated.map((e) => ({ id: e.id, main: `${e.net >= 0 ? "+" : "−"}${usd(Math.abs(e.net))}`, sub: `${(e.netPct * 100).toFixed(0)}%`, color: e.net >= 0 ? T.pos : T.neg }))} best={recon.bestId} />
                   <TotalRow label="Gross adj." cells={evaluated.map((e) => ({ id: e.id, main: usd(e.gross), sub: `${(e.grossPct * 100).toFixed(0)}%`, color: T.ink }))} best={recon.bestId} />
                   <TotalRow label="Adjusted" big cells={evaluated.map((e) => ({ id: e.id, main: usd(e.adjusted), color: e.id === recon.bestId ? T.accent : T.ink }))} best={recon.bestId} />
                 </tbody>
               </table>
             </div></div>
+            <div style={{ ...label, color: T.faint, marginTop: 8 }}>Blank (—) = unknown from public records; the engine skips it. Enter a value to adjust for it.</div>
             <NavRow onBack={() => go(2)} onNext={() => go(4)} nextLabel="Reconcile →" />
           </Section>
         )}
@@ -261,16 +318,22 @@ export default function BPOGenerator() {
 function Section({ title, sub, pill, children }) {
   return (<div style={{ ...card, padding: "22px 20px" }}>
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 16 }}>
-      <div><h2 style={{ fontSize: 20, fontWeight: 700, margin: "0 0 4px" }}>{title}</h2>{sub && <div style={{ color: T.sub, fontSize: 13, maxWidth: 620, lineHeight: 1.5 }}>{sub}</div>}</div>
+      <div><h2 style={{ fontSize: 20, fontWeight: 700, margin: "0 0 4px" }}>{title}</h2>{sub && <div style={{ color: T.sub, fontSize: 13, maxWidth: 640, lineHeight: 1.5 }}>{sub}</div>}</div>
       {pill && <Tag soft>{pill}</Tag>}
     </div>{children}</div>);
 }
 function Tag({ children, soft }) { return <span style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color: soft ? T.accent : "#fff", background: soft ? "transparent" : T.accent, border: `1px solid ${T.accent}`, borderRadius: 20, padding: "3px 8px", whiteSpace: "nowrap" }}>{children}</span>; }
+function Ctl({ lbl, value, onChange }) {
+  return (<label style={{ display: "block" }}>
+    <div style={{ ...label, marginBottom: 3 }}>{lbl}</div>
+    <input value={value} onChange={(e) => onChange(e.target.value)} inputMode="decimal" style={{ width: 90, border: `1px solid ${T.line}`, borderRadius: 8, background: T.card, padding: "8px 10px", ...mono, fontSize: 13, color: T.ink, outline: "none" }} />
+  </label>);
+}
 function Field({ lbl, value, onChange, flag, confirmed }) {
   const need = flag && !confirmed;
   return (<div style={{ background: need ? T.warnSoft : T.card, padding: "9px 12px", boxShadow: need ? `inset 3px 0 0 ${T.warn}` : "none" }}>
     <div style={{ ...label, marginBottom: 3, display: "flex", gap: 5, alignItems: "center" }}>{lbl}{flag && <span style={{ fontSize: 8, color: confirmed ? T.pos : T.warn }}>{confirmed ? "✓" : "confirm"}</span>}</div>
-    <input value={value} onChange={(e) => onChange(e.target.value)} inputMode="numeric" style={{ border: "none", background: "transparent", outline: "none", ...mono, fontSize: 14, color: T.ink, width: "100%" }} />
+    <input value={value ?? ""} placeholder="—" onChange={(e) => onChange(e.target.value)} inputMode="numeric" style={{ border: "none", background: "transparent", outline: "none", ...mono, fontSize: 14, color: T.ink, width: "100%" }} />
   </div>);
 }
 function FieldSelect({ lbl, value, opts, onChange, flag, confirmed }) {
@@ -315,18 +378,18 @@ function BPODoc({ subject, market, comps, recon, opinion, narrative, onBack }) {
     </div>
     <div style={{ ...card, padding: "26px 28px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", borderBottom: `2px solid ${T.ink}`, paddingBottom: 12, flexWrap: "wrap", gap: 10 }}>
-        <div><div style={{ fontSize: 19, fontWeight: 700 }}>{subject.address}</div><div style={{ color: T.sub, fontSize: 13 }}>{subject.city}, {subject.state} {subject.zip} · APN {subject.apn}</div></div>
+        <div><div style={{ fontSize: 19, fontWeight: 700 }}>{subject.address}</div><div style={{ color: T.sub, fontSize: 13 }}>{subject.city}, {subject.state} {subject.zip} · APN {fmt(subject.apn)}</div></div>
         <div style={{ textAlign: "right" }}><div style={{ ...label }}>Opinion of value (as-is)</div><div style={{ ...mono, fontSize: 26, fontWeight: 800, color: T.accent }}>{usd(opinion.sale90)}</div></div>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 26 }}>
-        <div><H>Subject</H><Row k="Style" v={`${subject.stories}-story SFR`} /><Row k="Living area" v={`${subject.gla} sf`} /><Row k="Lot" v={`${subject.lot} sf`} /><Row k="Year built" v={subject.year} /><Row k="Beds / baths" v={`${subject.beds} / ${subject.full}.${subject.half ? 5 : 0}`} /><Row k="Condition" v={subject.condition} /><Row k="Assessed / AVM" v={`${usd(subject.assessed)} / ${usd(subject.avm)}`} /></div>
+        <div><H>Subject</H><Row k="Style" v={`${fmt(subject.stories)}-story SFR`} /><Row k="Living area" v={`${fmt(subject.gla)} sf`} /><Row k="Lot" v={`${fmt(subject.lot)} sf`} /><Row k="Year built" v={fmt(subject.year)} /><Row k="Beds / baths" v={`${fmt(subject.beds)} / ${fmt(subject.full)}.${subject.half ? 5 : 0}`} /><Row k="Condition" v={subject.condition} /><Row k="Assessed / AVM" v={`${usd(subject.assessed)} / ${usd(subject.avm)}`} /></div>
         <div><H>Neighborhood & market</H><Row k="Market trend" v={`${market.trend} (${market.pricePct}%/yr)`} /><Row k="Housing supply" v={market.supply} /><Row k="Avg marketing time" v={`${market.avgDom} days`} /><Row k="Owner / tenant" v={`${market.ownerOcc}% / ${market.tenantOcc}%`} /><Row k="Sale range" v={`${usd(market.saleLow)}–${usd(market.saleHigh)}`} /></div>
       </div>
       <H>Comparable sales</H>
       <div style={{ overflowX: "auto" }}><table style={{ width: "100%", borderCollapse: "collapse", minWidth: 460, fontSize: 12 }}>
         <thead><tr>{["Address", "Dist", "GLA", "Sold", "Net adj", "Adjusted"].map((h) => <th key={h} style={{ textAlign: h === "Address" ? "left" : "right", padding: "6px 8px", borderBottom: `1px solid ${T.line}`, ...label }}>{h}</th>)}</tr></thead>
         <tbody>{comps.map((c) => (<tr key={c.id} style={{ borderBottom: `1px solid ${T.hair}` }}>
-          <td style={{ padding: "7px 8px", fontWeight: 600 }}>{c.address}</td><td style={{ ...mono, textAlign: "right", padding: "7px 8px", color: T.sub }}>{c.dist}</td><td style={{ ...mono, textAlign: "right", padding: "7px 8px", color: T.sub }}>{c.gla}</td>
+          <td style={{ padding: "7px 8px", fontWeight: 600 }}>{c.address}</td><td style={{ ...mono, textAlign: "right", padding: "7px 8px", color: T.sub }}>{fmt(c.dist)}</td><td style={{ ...mono, textAlign: "right", padding: "7px 8px", color: T.sub }}>{fmt(c.gla)}</td>
           <td style={{ ...mono, textAlign: "right", padding: "7px 8px" }}>{usd(c.price)}</td><td style={{ ...mono, textAlign: "right", padding: "7px 8px", color: c.net >= 0 ? T.pos : T.neg }}>{c.net >= 0 ? "+" : "−"}{usd(Math.abs(c.net))}</td>
           <td style={{ ...mono, textAlign: "right", padding: "7px 8px", fontWeight: 700, color: c.id === recon.bestId ? T.accent : T.ink }}>{usd(c.adjusted)}</td>
         </tr>))}</tbody>
